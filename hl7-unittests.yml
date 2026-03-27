@@ -1,0 +1,220 @@
+name: Build-Test-HL7UnitTests (Docker)
+
+on:
+  pull_request:
+    branches:
+      - docker-gha
+    paths-ignore:
+      - "**/*.md"
+  push:
+    branches:
+      - docker-gha
+    paths-ignore:
+      - "**/*.md"
+  workflow_dispatch:
+    inputs:
+      filter:
+        description: dotnet test filter (passed to dotnet test)
+        required: false
+        default: FullyQualifiedName~HL7UnitTests.ValidatorTests
+
+permissions:
+  id-token: write
+  contents: read
+  packages: read
+
+env:
+  HL7_DOCKER_IMAGE: hl7-unittests-tests
+  TEST_ENVIRONMENT: docker-gha
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on:
+      group: QA
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Configure NuGet (optional)
+        shell: bash
+        env:
+          HL7_NUGET_CONFIG_BASE64: ${{ secrets.HL7_NUGET_CONFIG_BASE64 }}
+          AZURE_DEVOPS_PASSWORD: ${{ secrets.AZURE_DEVOPS_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          MODULE_DIR="."
+          echo "HL7 module directory: $MODULE_DIR"
+
+          if [ -n "${AZURE_DEVOPS_PASSWORD:-}" ]; then
+            echo "AZURE_DEVOPS_PASSWORD provided; generating $MODULE_DIR/NuGet.auth.config."
+            printf '%s\n' \
+              '<?xml version="1.0" encoding="utf-8"?>' \
+              '<configuration>' \
+              '  <packageSources>' \
+              '    <add key="VaxCare" value="https://pkgs.dev.azure.com/VaxCareCorp/Development/_packaging/vaxnuget/nuget/v3/index.json" />' \
+              '    <add key="NuGet" value="https://api.nuget.org/v3/index.json" />' \
+              '  </packageSources>' \
+              '  <packageSourceCredentials>' \
+              '    <VaxCare>' \
+              '      <add key="Username" value="AzureDevOps" />' \
+              "      <add key=\"ClearTextPassword\" value=\"${AZURE_DEVOPS_PASSWORD}\" />" \
+              '    </VaxCare>' \
+              '  </packageSourceCredentials>' \
+              '</configuration>' \
+              > "$MODULE_DIR/NuGet.auth.config"
+            exit 0
+          fi
+
+          if [ -n "${HL7_NUGET_CONFIG_BASE64:-}" ]; then
+            echo "${HL7_NUGET_CONFIG_BASE64}" | base64 --decode > "$MODULE_DIR/NuGet.ci.config"
+            echo "Wrote $MODULE_DIR/NuGet.ci.config from HL7_NUGET_CONFIG_BASE64 secret."
+            exit 0
+          fi
+
+          if [ -f "$HOME/.nuget/NuGet/NuGet.Config" ]; then
+            echo "Found runner NuGet config at $HOME/.nuget/NuGet/NuGet.Config; will use it for restore/build."
+            exit 0
+          fi
+
+          echo "No NuGet config secrets; will try unauthenticated restore (may fail on private packages)."
+
+      - name: Build Docker image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MODULE_DIR="."
+          echo "HL7 module directory: $MODULE_DIR"
+
+          NUGET_CONFIG_SRC=""
+          if [ -f "$MODULE_DIR/NuGet.auth.config" ]; then
+            NUGET_CONFIG_SRC="$MODULE_DIR/NuGet.auth.config"
+          elif [ -f "$MODULE_DIR/NuGet.ci.config" ]; then
+            NUGET_CONFIG_SRC="$MODULE_DIR/NuGet.ci.config"
+          elif [ -f "$HOME/.nuget/NuGet/NuGet.Config" ]; then
+            NUGET_CONFIG_SRC="$HOME/.nuget/NuGet/NuGet.Config"
+          fi
+
+          SECRET_ARGS=""
+          if [ -n "$NUGET_CONFIG_SRC" ]; then
+            echo "Using NuGet config for build secret: $NUGET_CONFIG_SRC"
+            SECRET_ARGS="$SECRET_ARGS --secret id=nuget_config,src=$NUGET_CONFIG_SRC"
+          else
+            echo "No NuGet config found; build may fail on private packages."
+          fi
+
+          DOCKER_BUILDKIT=1 docker build \
+            -t "${HL7_DOCKER_IMAGE}:ci" \
+            -f docker/hl7-unittests.Dockerfile \
+            $SECRET_ARGS \
+            "$MODULE_DIR"
+
+      - name: Create test results directory
+        shell: bash
+        run: |
+          mkdir -p TestResults/html
+          chmod -R 777 TestResults || true
+          ls -la TestResults || true
+
+      - name: Run tests in Docker
+        id: run_tests
+        shell: bash
+        run: |
+          START_TS="$(date +%s)"
+          set +e
+
+          FILTER_INPUT="${{ github.event.inputs.filter }}"
+          if [ -z "$FILTER_INPUT" ]; then
+            FILTER_INPUT="FullyQualifiedName~HL7UnitTests.ValidatorTests"
+          fi
+
+          : > hl7-unittests-test-output.log
+
+          echo "Running HL7UnitTests with filter: $FILTER_INPUT"
+          docker run --rm \
+            -e TEST_RESULTS_DIR=/src/TestResults \
+            -e TEST_RESULTS_TRX_NAME=TestResults.trx \
+            -v "${{ github.workspace }}/TestResults:/src/TestResults" \
+            "${HL7_DOCKER_IMAGE}:ci" \
+            --filter "$FILTER_INPUT" 2>&1 | tee -a hl7-unittests-test-output.log
+
+          TEST_EXIT_CODE=${PIPESTATUS[0]}
+          set -e
+          END_TS="$(date +%s)"
+          TEST_DURATION_SECONDS="$((END_TS - START_TS))"
+          TEST_DURATION_MINUTES="$(awk -v s="$TEST_DURATION_SECONDS" 'BEGIN { printf "%.1f", s/60 }')"
+
+          echo "TEST_EXIT_CODE=$TEST_EXIT_CODE" >> "$GITHUB_OUTPUT"
+          echo "TEST_DURATION_SECONDS=$TEST_DURATION_SECONDS" >> "$GITHUB_OUTPUT"
+          echo "TEST_DURATION_MINUTES=$TEST_DURATION_MINUTES" >> "$GITHUB_OUTPUT"
+          echo "Docker run exit code: $TEST_EXIT_CODE"
+          echo "Test duration: ${TEST_DURATION_MINUTES} min (${TEST_DURATION_SECONDS} sec)"
+          exit 0
+
+      - name: Ensure log exists (for artifact upload)
+        if: always()
+        shell: bash
+        run: |
+          if [ ! -f hl7-unittests-test-output.log ]; then
+            echo "hl7-unittests-test-output.log was not created (previous step likely failed early)." > hl7-unittests-test-output.log
+          fi
+
+      - name: Process TRX results
+        if: always()
+        id: process_results
+        shell: bash
+        run: |
+          python3 scripts/ci/process_trx_results.py \
+            --trx "TestResults/TestResults.trx" \
+            --html "TestResults/html/index.html" \
+            --github-output "$GITHUB_OUTPUT" \
+            --github-step-summary "$GITHUB_STEP_SUMMARY" \
+            --test-exit-code "${{ steps.run_tests.outputs.TEST_EXIT_CODE }}" \
+            --duration-seconds "${{ steps.run_tests.outputs.TEST_DURATION_SECONDS }}" \
+            --duration-minutes "${{ steps.run_tests.outputs.TEST_DURATION_MINUTES }}" \
+            --environment "${{ env.TEST_ENVIRONMENT }}" \
+            --repo "${{ github.repository }}" \
+            --branch "${{ github.ref_name }}" \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hl7-unittests-test-results
+          path: |
+            TestResults
+            hl7-unittests-test-output.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Notify Microsoft Teams
+        if: always()
+        continue-on-error: true
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+        shell: bash
+        run: |
+          python3 scripts/ci/notify_teams.py \
+            --webhook-url "${TEAMS_WEBHOOK_URL}" \
+            --status "${{ steps.process_results.outputs.STATUS }}" \
+            --environment "${{ env.TEST_ENVIRONMENT }}" \
+            --repo "${{ github.repository }}" \
+            --branch "${{ github.ref_name }}" \
+            --duration-minutes "${{ steps.run_tests.outputs.TEST_DURATION_MINUTES }}" \
+            --total "${{ steps.process_results.outputs.TOTAL }}" \
+            --passed "${{ steps.process_results.outputs.PASSED }}" \
+            --failed "${{ steps.process_results.outputs.FAILED }}" \
+            --skipped "${{ steps.process_results.outputs.SKIPPED }}" \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --title "HL7 Unit Test Results"
+
+      - name: Fail if tests failed
+        if: steps.process_results.outputs.TESTS_FAILED == 'true'
+        shell: bash
+        run: |
+          echo "HL7UnitTests failed (exit code: ${{ steps.run_tests.outputs.TEST_EXIT_CODE }})"
+          exit 1
+
