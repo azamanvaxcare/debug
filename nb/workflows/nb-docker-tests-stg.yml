@@ -1,0 +1,232 @@
+name: Build-Test-NightlyBilling STG (Docker)
+
+on:
+  push:
+    branches:
+      - docker-gha
+  pull_request:
+    branches:
+      - docker-gha
+  workflow_dispatch:
+    inputs:
+      filter:
+        description: dotnet test filter (passed to dotnet test)
+        required: false
+        default: FullyQualifiedName~NightlyBillingUnitTests.EDI837IntegrationTests
+
+permissions:
+  id-token: write
+  contents: read
+  packages: read
+
+env:
+  NB_DOCKER_IMAGE: nightlybilling-tests-stg
+  TEST_ENVIRONMENT: STG
+
+jobs:
+  test:
+    name: Build + run NightlyBilling tests (Docker, STG)
+    runs-on:
+      group: QA
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Resolve module directory
+        id: module_dir
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MODULE_DIR="."
+          if [ -f "NightlyBilling.sln" ]; then
+            MODULE_DIR="."
+          elif [ -f "NightlyBilling/NightlyBilling.sln" ]; then
+            MODULE_DIR="NightlyBilling"
+          else
+            echo "Could not locate NightlyBilling.sln in the repo root or ./NightlyBilling." >&2
+            exit 1
+          fi
+
+          echo "path=$MODULE_DIR" >> "$GITHUB_OUTPUT"
+          echo "NightlyBilling module directory: $MODULE_DIR"
+
+      - name: Configure NuGet (optional)
+        shell: bash
+        env:
+          NB_NUGET_CONFIG_BASE64: ${{ secrets.NB_NUGET_CONFIG_BASE64 }}
+          AZURE_DEVOPS_PASSWORD: ${{ secrets.AZURE_DEVOPS_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          MODULE_DIR="${{ steps.module_dir.outputs.path }}"
+          echo "NightlyBilling module directory: $MODULE_DIR"
+
+          # If an Azure Artifacts PAT is available, generate an authenticated NuGet.Config.
+          # This avoids depending on runner-global NuGet configuration inside the container.
+          if [ -n "${AZURE_DEVOPS_PASSWORD:-}" ]; then
+            echo "AZURE_DEVOPS_PASSWORD provided; generating $MODULE_DIR/NuGet.auth.config."
+            printf '%s\n' \
+              '<?xml version="1.0" encoding="utf-8"?>' \
+              '<configuration>' \
+              '  <packageSources>' \
+              '    <add key="VaxCare" value="https://pkgs.dev.azure.com/VaxCareCorp/Development/_packaging/vaxnuget/nuget/v3/index.json" />' \
+              '    <add key="NuGet" value="https://api.nuget.org/v3/index.json" />' \
+              '  </packageSources>' \
+              '  <packageSourceCredentials>' \
+              '    <VaxCare>' \
+              '      <add key="Username" value="AzureDevOps" />' \
+              "      <add key=\"ClearTextPassword\" value=\"${AZURE_DEVOPS_PASSWORD}\" />" \
+              '    </VaxCare>' \
+              '  </packageSourceCredentials>' \
+              '</configuration>' \
+              > "$MODULE_DIR/NuGet.auth.config"
+            exit 0
+          fi
+
+          if [ -n "${NB_NUGET_CONFIG_BASE64:-}" ]; then
+            echo "${NB_NUGET_CONFIG_BASE64}" | base64 --decode > "$MODULE_DIR/NuGet.ci.config"
+            echo "Wrote $MODULE_DIR/NuGet.ci.config from NB_NUGET_CONFIG_BASE64 secret."
+            exit 0
+          fi
+
+          if [ -f "$MODULE_DIR/NuGet.config" ]; then
+            echo "Found $MODULE_DIR/NuGet.config in repo; will use it for restore/build."
+            exit 0
+          fi
+
+          echo "No repo NuGet config and no secrets; will try runner's NuGet config (if present)."
+
+      - name: Build Docker image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MODULE_DIR="${{ steps.module_dir.outputs.path }}"
+          echo "NightlyBilling module directory: $MODULE_DIR"
+
+          NUGET_CONFIG_SRC=""
+          if [ -f "$MODULE_DIR/NuGet.auth.config" ]; then
+            NUGET_CONFIG_SRC="$MODULE_DIR/NuGet.auth.config"
+          elif [ -f "$MODULE_DIR/NuGet.ci.config" ]; then
+            NUGET_CONFIG_SRC="$MODULE_DIR/NuGet.ci.config"
+          elif [ -f "$MODULE_DIR/NuGet.config" ]; then
+            NUGET_CONFIG_SRC="$MODULE_DIR/NuGet.config"
+          elif [ -f "$HOME/.nuget/NuGet/NuGet.Config" ]; then
+            NUGET_CONFIG_SRC="$HOME/.nuget/NuGet/NuGet.Config"
+          fi
+
+          SECRET_ARGS=""
+          if [ -n "$NUGET_CONFIG_SRC" ]; then
+            echo "Using NuGet config for build secret: $NUGET_CONFIG_SRC"
+            SECRET_ARGS="$SECRET_ARGS --secret id=nuget_config,src=$NUGET_CONFIG_SRC"
+          else
+            echo "No NuGet config found; build may fail on private packages."
+          fi
+
+          DOCKER_BUILDKIT=1 docker build \
+            -t "${NB_DOCKER_IMAGE}:ci" \
+            -f .github/docker/nightlybilling.Dockerfile \
+            $SECRET_ARGS \
+            "$MODULE_DIR"
+
+      - name: Run tests in Docker
+        id: run_tests
+        shell: bash
+        run: |
+          START_TS="$(date +%s)"
+          set +e
+
+          FILTER_INPUT="${{ github.event.inputs.filter }}"
+          if [ -z "$FILTER_INPUT" ]; then
+            FILTER_INPUT="FullyQualifiedName~NightlyBillingUnitTests.EDI837IntegrationTests"
+          fi
+
+          RESULTS_DIR="$PWD/TestResults/stg"
+
+          # Ensure the log file and results directory exist so artifact upload never warns.
+          : > nightlybilling-test-output.log
+          mkdir -p "$RESULTS_DIR"
+
+          echo "Running NightlyBilling tests in STG with filter: $FILTER_INPUT"
+          docker run --rm \
+            -v "$RESULTS_DIR:/test-results" \
+            -e ENV=STG \
+            "${NB_DOCKER_IMAGE}:ci" \
+            --logger "trx;LogFileName=nightlybilling-stg.trx" \
+            --results-directory /test-results \
+            --filter "$FILTER_INPUT" 2>&1 | tee -a nightlybilling-test-output.log
+
+          END_TS="$(date +%s)"
+          DURATION_SECONDS="$((END_TS - START_TS))"
+          DURATION_MINUTES="$(awk -v s="$DURATION_SECONDS" 'BEGIN { printf "%.1f", s/60 }')"
+          EXIT_CODE=${PIPESTATUS[0]}
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+          echo "duration_seconds=$DURATION_SECONDS" >> "$GITHUB_OUTPUT"
+          echo "duration_minutes=$DURATION_MINUTES" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Ensure log exists (for artifact upload)
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p TestResults/stg
+          if [ ! -f nightlybilling-test-output.log ]; then
+            echo "nightlybilling-test-output.log was not created (previous step likely failed early)." > nightlybilling-test-output.log
+          fi
+
+      - name: Generate HTML test report
+        if: always()
+        shell: bash
+        run: |
+          python3 scripts/trx_to_html.py \
+            --input-dir TestResults/stg \
+            --output-file TestResults/stg/nightlybilling-stg.html \
+            --title "NightlyBilling STG Test Report"
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightlybilling-test-results-stg
+          path: |
+            nightlybilling-test-output.log
+            TestResults/stg
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Write summary and notify Teams
+        if: always()
+        id: test_report
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          TEAMS_WEBHOOK_URL_STG: ${{ secrets.TEAMS_WEBHOOK_URL_STG }}
+        shell: bash
+        run: |
+          WEBHOOK_URL="${TEAMS_WEBHOOK_URL_STG:-${TEAMS_WEBHOOK_URL:-}}"
+          python3 scripts/trx_summary.py \
+            --input-dir TestResults/stg \
+            --environment "${TEST_ENVIRONMENT}" \
+            --exit-code "${{ steps.run_tests.outputs.exit_code }}" \
+            --duration-seconds "${{ steps.run_tests.outputs.duration_seconds }}" \
+            --duration-minutes "${{ steps.run_tests.outputs.duration_minutes }}" \
+            --github-output "$GITHUB_OUTPUT" \
+            --step-summary "$GITHUB_STEP_SUMMARY" \
+            --teams-webhook-url "$WEBHOOK_URL" \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --repo "${{ github.repository }}" \
+            --branch "${{ github.ref_name }}"
+
+      - name: Fail if tests failed
+        if: steps.test_report.outputs.tests_failed == 'true'
+        shell: bash
+        run: |
+          echo "NightlyBilling STG tests failed (exit code: ${{ steps.run_tests.outputs.exit_code }})"
+          exit 1
