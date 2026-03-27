@@ -1,0 +1,241 @@
+name: VaxCare API Tests QA
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      filter:
+        description: dotnet test filter (passed through to the Python test runner)
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  TEST_ENVIRONMENT: QA
+  REPORTS_DIR: TestReports/qa
+
+jobs:
+  test:
+    name: Build + run VaxCare API tests (QA)
+    runs-on:
+      group: QA
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Create base appsettings.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > appsettings.json <<'EOF'
+          {
+            "ApiConfiguration": {
+              "BaseUrl": "https://placeholder.invalid",
+              "Timeout": 60000,
+              "InsecureHttps": true,
+              "RetryConfiguration": {
+                "MaxRetryAttempts": 3,
+                "RetryDelayMs": 2000,
+                "ExponentialBackoff": true,
+                "MaxRetryDelayMs": 10000
+              }
+            },
+            "TestConfiguration": {
+              "Environment": "QA",
+              "LogLevel": "Information"
+            },
+            "Headers": {
+              "IsCalledByJob": "",
+              "X-VaxHub-Identifier": "",
+              "traceparent": "",
+              "MobileData": "",
+              "UserSessionId": "",
+              "MessageSource": "",
+              "Host": "",
+              "Connection": "",
+              "User-Agent": ""
+            }
+          }
+          EOF
+
+      - name: Write QA appsettings override
+        shell: bash
+        env:
+          APPSETTINGS_QA_JSON: ${{ secrets.APPSETTINGS_QA_JSON }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APPSETTINGS_QA_JSON:-}" ]; then
+            echo "Missing required secret: APPSETTINGS_QA_JSON" >&2
+            exit 1
+          fi
+          printf '%s' "$APPSETTINGS_QA_JSON" > appsettings.QA.json
+
+      - name: Run tests with reporting
+        id: run_tests
+        shell: bash
+        env:
+          ASPNETCORE_ENVIRONMENT: QA
+        run: |
+          START_TS="$(date +%s)"
+          set +e
+
+          FILTER_INPUT="${{ github.event.inputs.filter }}"
+          mkdir -p "${REPORTS_DIR}"
+          : > vaxcare-api-tests-qa.log
+
+          CMD=(python3 run-all-tests.py --environment QA --output "${REPORTS_DIR}" --no-open)
+          if [ -n "${FILTER_INPUT}" ]; then
+            CMD+=(--filter "${FILTER_INPUT}")
+          fi
+
+          echo "Running QA tests with filter: ${FILTER_INPUT:-<none>}"
+          "${CMD[@]}" 2>&1 | tee -a vaxcare-api-tests-qa.log
+
+          END_TS="$(date +%s)"
+          DURATION_SECONDS="$((END_TS - START_TS))"
+          EXIT_CODE=${PIPESTATUS[0]}
+
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+          echo "duration_seconds=$DURATION_SECONDS" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Ensure test log exists
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "${REPORTS_DIR}"
+          if [ ! -f vaxcare-api-tests-qa.log ]; then
+            echo "vaxcare-api-tests-qa.log was not created." > vaxcare-api-tests-qa.log
+          fi
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vaxcare-api-test-results-qa
+          path: |
+            vaxcare-api-tests-qa.log
+            TestReports/qa
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Write workflow summary
+        if: always()
+        id: test_report
+        shell: bash
+        env:
+          TEST_EXIT_CODE: ${{ steps.run_tests.outputs.exit_code }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob
+          import os
+          import xml.etree.ElementTree as ET
+
+          report_root = os.environ["REPORTS_DIR"]
+          env_name = os.environ["TEST_ENVIRONMENT"]
+          exit_code = int(os.environ.get("TEST_EXIT_CODE") or "1")
+          xml_candidates = sorted(
+              glob.glob(os.path.join(report_root, "**", "*.xml"), recursive=True),
+              key=os.path.getmtime,
+              reverse=True,
+          )
+
+          xml_file = xml_candidates[0] if xml_candidates else ""
+          total = passed = failed = skipped = 0
+          parse_error = ""
+
+          if xml_file:
+              try:
+                  root = ET.parse(xml_file).getroot()
+                  tests = list(root.findall(".//test"))
+                  if tests:
+                      total = len(tests)
+                      passed = sum(1 for t in tests if t.get("result") == "Pass")
+                      failed = sum(1 for t in tests if t.get("result") == "Fail")
+                      skipped = sum(1 for t in tests if t.get("result") == "Skip")
+                  else:
+                      trx_results = list(root.findall(".//UnitTestResult"))
+                      total = len(trx_results)
+                      passed = sum(1 for t in trx_results if t.get("outcome") == "Passed")
+                      failed = sum(1 for t in trx_results if t.get("outcome") == "Failed")
+                      skipped = sum(1 for t in trx_results if t.get("outcome") == "Skipped")
+              except Exception as exc:
+                  parse_error = str(exc)
+
+          tests_failed = exit_code != 0 or failed > 0
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"tests_failed={'true' if tests_failed else 'false'}\n")
+              fh.write(f"xml_file={xml_file}\n")
+              fh.write(f"total={total}\n")
+              fh.write(f"passed={passed}\n")
+              fh.write(f"failed={failed}\n")
+              fh.write(f"skipped={skipped}\n")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
+              fh.write(f"## VaxCare API Tests ({env_name})\n\n")
+              fh.write(f"- Exit code: `{exit_code}`\n")
+              fh.write(f"- Total: `{total}`\n")
+              fh.write(f"- Passed: `{passed}`\n")
+              fh.write(f"- Failed: `{failed}`\n")
+              fh.write(f"- Skipped: `{skipped}`\n")
+              if xml_file:
+                  fh.write(f"- Results file: `{xml_file}`\n")
+              else:
+                  fh.write("- Results file: not found\n")
+              if parse_error:
+                  fh.write(f"- XML parse warning: `{parse_error}`\n")
+          PY
+
+      - name: Notify Teams
+        if: always()
+        shell: bash
+        env:
+          XML_FILE: ${{ steps.test_report.outputs.xml_file }}
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          TEAMS_WEBHOOK_URL_QA: ${{ secrets.TEAMS_WEBHOOK_URL_QA }}
+        run: |
+          set -euo pipefail
+          WEBHOOK_URL="${TEAMS_WEBHOOK_URL_QA:-${TEAMS_WEBHOOK_URL:-}}"
+
+          if [ -z "${WEBHOOK_URL}" ]; then
+            echo "No Teams webhook configured; skipping notification."
+            exit 0
+          fi
+
+          if [ -z "${XML_FILE}" ] || [ ! -f "${XML_FILE}" ]; then
+            echo "No XML test result file available; skipping notification."
+            exit 0
+          fi
+
+          python3 TestRunner/send-teams-notification.py \
+            --xml "${XML_FILE}" \
+            --environment "${TEST_ENVIRONMENT}" \
+            --webhook "${WEBHOOK_URL}"
+
+      - name: Fail if tests failed
+        if: steps.test_report.outputs.tests_failed == 'true'
+        shell: bash
+        run: |
+          echo "VaxCare API QA tests failed (exit code: ${{ steps.run_tests.outputs.exit_code }})"
+          exit 1
