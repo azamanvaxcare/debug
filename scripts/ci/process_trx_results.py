@@ -56,6 +56,7 @@ def parse_trx(trx_path: Path) -> dict[str, object]:
         "skipped": "unknown",
     }
     failed_tests: list[dict[str, str]] = []
+    executed_tests: list[dict[str, str]] = []
     outcome = "Unknown"
 
     if not trx_path.is_file():
@@ -63,6 +64,7 @@ def parse_trx(trx_path: Path) -> dict[str, object]:
             **totals,
             "outcome": outcome,
             "failed_tests": failed_tests,
+            "executed_tests": executed_tests,
             "trx_found": False,
         }
 
@@ -105,9 +107,19 @@ def parse_trx(trx_path: Path) -> dict[str, object]:
         totals["skipped"] = str(skipped_count)
 
     for result in findall(root, "UnitTestResult"):
-        if result.attrib.get("outcome") != "Failed":
-            continue
         test_name = text_or_default(result.attrib.get("testName"), "Unnamed test")
+        test_outcome = text_or_default(result.attrib.get("outcome"), "Unknown")
+        test_duration = text_or_default(result.attrib.get("duration"), "")
+        executed_tests.append(
+            {
+                "name": test_name,
+                "outcome": test_outcome,
+                "duration": test_duration,
+            }
+        )
+
+        if test_outcome != "Failed":
+            continue
         message = ""
         stack_trace = ""
         output = find_child(result, "Output")
@@ -134,6 +146,7 @@ def parse_trx(trx_path: Path) -> dict[str, object]:
         **totals,
         "outcome": outcome,
         "failed_tests": failed_tests,
+        "executed_tests": executed_tests,
         "trx_found": True,
     }
 
@@ -165,6 +178,16 @@ def build_markdown_summary(data: dict[str, object], args: argparse.Namespace, st
 
 
 def build_html_report(data: dict[str, object], args: argparse.Namespace, status: str) -> str:
+    executed_rows = []
+    for test in data["executed_tests"]:
+        executed_rows.append(
+            "<tr>"
+            f"<td>{html.escape(test['name'])}</td>"
+            f"<td>{html.escape(test['outcome'])}</td>"
+            f"<td>{html.escape(test['duration'] or '-')}</td>"
+            "</tr>"
+        )
+
     failed_rows = []
     for failed in data["failed_tests"]:
         failed_rows.append(
@@ -181,6 +204,14 @@ def build_html_report(data: dict[str, object], args: argparse.Namespace, status:
         f"<tbody>{''.join(failed_rows)}</tbody></table>"
         if failed_rows
         else "<h2>Failed Tests</h2><p>No failed tests recorded.</p>"
+    )
+
+    executed_table = (
+        "<h2>Executed Tests</h2>"
+        "<table><thead><tr><th>Name</th><th>Outcome</th><th>Duration</th></tr></thead>"
+        f"<tbody>{''.join(executed_rows)}</tbody></table>"
+        if executed_rows
+        else "<h2>Executed Tests</h2><p>No executed tests were found in the TRX file.</p>"
     )
 
     run_link = (
@@ -223,6 +254,7 @@ def build_html_report(data: dict[str, object], args: argparse.Namespace, status:
     </tbody>
   </table>
   {run_link}
+  {executed_table}
   {failed_table}
 </body>
 </html>
